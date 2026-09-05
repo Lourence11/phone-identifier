@@ -4,3 +4,4 @@ xlsxwriter
 openpyxl 
 phonenumbers 
 httpx
+fastexcel
