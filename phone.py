@@ -8,10 +8,10 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="PH Multi-Channel Phone Identifier", layout="wide")
+st.set_page_config(page_title="PH Phone & Landline Identifier", layout="wide")
 
 # =====================================================================
-# 1. PYDANTIC GUARDS (Input Cell Scrubbing)
+# 1. PYDANTIC GUARDS (Input Hygiene)
 # =====================================================================
 class NumberCell(BaseModel):
     raw_val: str
@@ -21,13 +21,14 @@ class NumberCell(BaseModel):
         if val is None:
             return ""
         s = str(val).strip()
-        if s.endswith(".0"):  # Fix Excel auto-float conversions
+        # Strip float formatting (.0) common in Excel exports
+        if s.endswith(".0"):
             s = s[:-2]
         return s
 
 
 # =====================================================================
-# 2. VALIDATION ENGINES (Mobile, Metro 02, Provincial)
+# 2. TELECOM VALIDATION ENGINE (NTC Compliant + Anti-Dummy Rules)
 # =====================================================================
 VALID_PROVINCIAL_AREAS = {
     "32", "33", "34", "35", "36", "38",
@@ -38,7 +39,13 @@ VALID_PROVINCIAL_AREAS = {
     "82", "83", "84", "85", "86", "87", "88"
 }
 
+# Known mobile prefix blocks (Globe, Smart, Dito, legacy Sun/Red)
+VALID_MOBILE_PREFIXES_2DIGIT = {"90", "91", "92", "93", "94", "95", "96", "97", "98", "99", "89", "81"}
+
+SEQUENTIAL_PATTERNS = {"1234567", "2345678", "3456789", "7654321", "9876543", "8765432"}
+
 def clean_to_digits(raw_val: str) -> str:
+    """Strips international codes (+63, 63) and trunk prefix (0)."""
     cleaned = re.sub(r'[\s\-\(\)\.]', '', str(raw_val).strip())
     if cleaned.startswith('+63'):
         cleaned = cleaned[3:]
@@ -48,63 +55,152 @@ def clean_to_digits(raw_val: str) -> str:
         cleaned = cleaned[1:]
     return cleaned
 
+def is_dummy_or_restricted(local_digits: str, min_repeat_len: int = 5) -> tuple[bool, str]:
+    """
+    Detects dummy entries (1111111, 0000000, 1234567) and NTC restricted prefixes (0, 1).
+    """
+    # 1. Total or near-total repeated digits (e.g. 1111111, 9999999)
+    if len(set(local_digits)) == 1:
+        return True, "Repeated Dummy Number"
+    
+    # Check repeated runs like '111111'
+    for char in set(local_digits):
+        if char * min_repeat_len in local_digits:
+            return True, "Suspicious Repetitive Digits"
+
+    # 2. Sequential numbers (e.g. 1234567)
+    if local_digits[:7] in SEQUENTIAL_PATTERNS:
+        return True, "Sequential Dummy Pattern"
+
+    # 3. NTC Rule: Local subscriber numbers CANNOT begin with 0 or 1
+    # Digits starting with 1 are reserved for emergency, short codes (117, 911, 171), or operator routing
+    if local_digits.startswith(('0', '1')):
+        return True, "Reserved Prefix (Starts with 0 or 1)"
+
+    return False, ""
+
 def validate_number(raw_val: str, expected_type: str) -> Dict[str, Any]:
     cleaned = clean_to_digits(raw_val)
     if not cleaned:
-        return {"status": "BLANK", "type": "Empty", "e164": "", "local": ""}
+        return {
+            "status": "BLANK", 
+            "type": "Empty", 
+            "e164": "", 
+            "local": "", 
+            "remark": "Empty Cell"
+        }
 
-    # 1. Mobile Check (10 digits starting with 9 or 8)
-    is_mobile = len(cleaned) == 10 and re.match(r'^(9\d{9}|8[1-9]\d{8})$', cleaned)
+    # Ensure pure digits
+    if not cleaned.isdigit():
+        return {
+            "status": "INVALID", 
+            "type": "Malformed", 
+            "e164": cleaned, 
+            "local": cleaned, 
+            "remark": "Contains non-numeric characters"
+        }
 
-    # 2. GMA / Area 02 Check (9 digits starting with 2 + valid PTE digit)
-    is_gma = (
-        len(cleaned) == 9 
-        and cleaned.startswith('2') 
-        and cleaned[1] in {'3', '5', '6', '7', '8'}
-    )
-
-    # 3. Provincial Check (9 digits starting with registered area code)
-    is_provincial = len(cleaned) == 9 and cleaned[:2] in VALID_PROVINCIAL_AREAS
-
-    # Check for legacy 7-digit Metro Manila numbers
-    is_outdated_gma = len(cleaned) == 8 and cleaned.startswith('2')
-
-    if is_mobile:
+    # -------------------------------------------------------------
+    # 1. MOBILE VALIDATION (10 Digits)
+    # -------------------------------------------------------------
+    if len(cleaned) == 10 and cleaned[:2] in VALID_MOBILE_PREFIXES_2DIGIT:
+        subscriber_part = cleaned[3:]  # Last 7 digits
+        is_dummy, reason = is_dummy_or_restricted(subscriber_part, min_repeat_len=6)
+        if is_dummy:
+            return {
+                "status": "INVALID",
+                "type": "Mobile (Dummy)",
+                "e164": f"+63{cleaned}",
+                "local": f"0{cleaned}",
+                "remark": f"Fake/Dummy Mobile: {reason}"
+            }
         return {
             "status": "VALID",
             "type": "Mobile",
             "e164": f"+63{cleaned}",
-            "local": f"0{cleaned}"
+            "local": f"0{cleaned}",
+            "remark": "Valid Philippine Mobile"
         }
-    elif is_gma:
+
+    # -------------------------------------------------------------
+    # 2. METRO MANILA / GMA LANDLINE (Area Code 2 + 8-Digit Local)
+    # -------------------------------------------------------------
+    if len(cleaned) == 9 and cleaned.startswith('2'):
+        pte_digit = cleaned[1]   # 3=Bayan, 5=Eastern, 6=ABS-CBN, 7=Globe, 8=PLDT
+        subscriber_local = cleaned[2:]  # 7-digit local part after operator identifier
+
+        if pte_digit not in {'3', '5', '6', '7', '8'}:
+            return {
+                "status": "INVALID",
+                "type": "Landline (Area 02)",
+                "e164": cleaned,
+                "local": cleaned,
+                "remark": f"Invalid Area 02 PTE Operator Prefix ({pte_digit})"
+            }
+
+        # Check subscriber line for 0/1 or repetitive dummies
+        is_dummy, reason = is_dummy_or_restricted(subscriber_local)
+        if is_dummy:
+            return {
+                "status": "INVALID",
+                "type": "Landline (Area 02)",
+                "e164": f"+63{cleaned}",
+                "local": f"02-{cleaned[1:5]}-{cleaned[5:]}",
+                "remark": f"Invalid Subscriber: {reason}"
+            }
+
         return {
             "status": "VALID",
             "type": "Landline (GMA 02)",
             "e164": f"+63{cleaned}",
-            "local": f"02-{cleaned[1:5]}-{cleaned[5:]}"
+            "local": f"02-{cleaned[1:5]}-{cleaned[5:]}",
+            "remark": "Valid Metro Manila / GMA 8-Digit Landline"
         }
-    elif is_provincial:
+
+    # -------------------------------------------------------------
+    # 3. PROVINCIAL LANDLINE (2-Digit Area Code + 7-Digit Local)
+    # -------------------------------------------------------------
+    if len(cleaned) == 9 and cleaned[:2] in VALID_PROVINCIAL_AREAS:
         area = cleaned[:2]
+        subscriber_local = cleaned[2:]
+
+        is_dummy, reason = is_dummy_or_restricted(subscriber_local)
+        if is_dummy:
+            return {
+                "status": "INVALID",
+                "type": f"Landline (Area 0{area})",
+                "e164": f"+63{cleaned}",
+                "local": f"0{area}-{subscriber_local[:3]}-{subscriber_local[3:]}",
+                "remark": f"Invalid Provincial Subscriber: {reason}"
+            }
+
         return {
             "status": "VALID",
             "type": f"Landline (Area 0{area})",
             "e164": f"+63{cleaned}",
-            "local": f"0{area}-{cleaned[2:5]}-{cleaned[5:]}"
+            "local": f"0{area}-{subscriber_local[:3]}-{subscriber_local[3:]}",
+            "remark": "Valid Provincial Landline"
         }
-    elif is_outdated_gma:
+
+    # -------------------------------------------------------------
+    # 4. EXPLICIT ERROR CATCHERS
+    # -------------------------------------------------------------
+    if len(cleaned) == 8 and cleaned.startswith('2'):
         return {
             "status": "INVALID",
-            "type": "Old 7-digit Manila",
+            "type": "Legacy Landline",
             "e164": cleaned,
-            "local": cleaned
+            "local": cleaned,
+            "remark": "Unmigrated 7-digit Manila landline (needs 8-digit PTE prefix)"
         }
-    else:
-        return {
-            "status": "INVALID",
-            "type": "Invalid Format",
-            "e164": cleaned,
-            "local": cleaned
-        }
+
+    return {
+        "status": "INVALID",
+        "type": "Unrecognized",
+        "e164": cleaned,
+        "local": cleaned,
+        "remark": f"Invalid length ({len(cleaned)} digits) or unregistered prefix"
+    }
 
 
 # =====================================================================
@@ -118,69 +214,71 @@ def export_multi_column_excel(df: pl.DataFrame, col_map: Dict[str, str]) -> io.B
     base_cols = [c for c in df.columns if not c.startswith("_meta_")]
     headers = list(base_cols)
 
-    # Build target output columns
+    # Build target columns
     for label in ["Mobile", "Telephone", "Landline"]:
         if col_map.get(label):
             headers.extend([
                 f"{label} Status",
                 f"{label} E.164",
-                f"{label} Local"
+                f"{label} Formatted",
+                f"{label} Remark"
             ])
     
-    headers.append("Master Reachability (Formula)")
+    headers.append("Master Dialable Status (Formula)")
     ws.append(headers)
 
-    # Styles
+    # Styling
     navy_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
     header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
     data_font = Font(name="Segoe UI", size=9)
     thin_border = Border(
-        left=Side(style="thin", color="D9D9D9"),
-        right=Side(style="thin", color="D9D9D9"),
-        top=Side(style="thin", color="D9D9D9"),
-        bottom=Side(style="thin", color="D9D9D9")
+        left=Side(style="thin", color="E0E0E0"),
+        right=Side(style="thin", color="E0E0E0"),
+        top=Side(style="thin", color="E0E0E0"),
+        bottom=Side(style="thin", color="E0E0E0")
     )
 
-    # Row iteration
     for row_idx, row in enumerate(df.iter_rows(named=True), start=2):
         row_vals = [row[c] for c in base_cols]
-        status_col_letters = []
+        status_letters = []
 
         curr_col_idx = len(base_cols) + 1
         for label in ["Mobile", "Telephone", "Landline"]:
             if col_map.get(label):
-                status_col_letters.append(get_column_letter(curr_col_idx))
+                status_letters.append(get_column_letter(curr_col_idx))
                 row_vals.extend([
                     row[f"_meta_{label}_status"],
                     row[f"_meta_{label}_e164"],
-                    row[f"_meta_{label}_local"]
+                    row[f"_meta_{label}_local"],
+                    row[f"_meta_{label}_remark"]
                 ])
-                curr_col_idx += 3
+                curr_col_idx += 4
 
-        # Dynamic formula: checks if any of the three columns have a "VALID" status
-        or_conditions = ",".join([f'{col}{row_idx}="VALID"' for col in status_col_letters])
-        master_formula = f'=IF(OR({or_conditions}), "REACHABLE", "NO VALID NUMBERS")'
-        row_vals.append(master_formula)
+        # Dynamic Formula: evaluates if at least one number is VALID
+        or_tests = ",".join([f'{col}{row_idx}="VALID"' for col in status_letters])
+        dynamic_formula = f'=IF(OR({or_tests}), "DIALABLE", "ALL INVALID / UNREACHABLE")'
+        row_vals.append(dynamic_formula)
 
         ws.append(row_vals)
 
-    # Format cells
+    # Headers formatting
     for col_idx in range(1, len(headers) + 1):
         c = ws.cell(row=1, column=col_idx)
         c.fill = navy_fill
         c.font = header_font
         c.alignment = Alignment(horizontal="center", vertical="center")
 
+    # Data formatting
     for r in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(headers)):
-        for c in r:
-            c.font = data_font
-            c.border = thin_border
+        for cell in r:
+            cell.font = data_font
+            cell.border = thin_border
 
-    # Auto-fit column widths
+    # Auto-adjust column widths
     for col in ws.columns:
         max_len = max(len(str(cell.value or "")) for cell in col)
         col_letter = get_column_letter(col[0].column)
-        ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
+        ws.column_dimensions[col_letter].width = max(max_len + 3, 13)
 
     output = io.BytesIO()
     wb.save(output)
@@ -189,23 +287,25 @@ def export_multi_column_excel(df: pl.DataFrame, col_map: Dict[str, str]) -> io.B
 
 
 # =====================================================================
-# 4. STREAMLIT UI
+# 4. STREAMLIT APP UI
 # =====================================================================
-st.title("Philippine Phone, Telephone & Landline Identifier")
-st.caption("Validates Mobile (09XX/08XX), Metro Manila Area 02 (8-digit NTC), and Provincial Area Codes simultaneously.")
+st.title("Philippine Contact Number Scrubbing Engine")
+st.caption("Validates Mobile, Manila GMA (Area 02), and Provincial landlines. Flags dummy numbers, repetitive test sequences, and NTC reserved prefixes.")
 
-uploaded_file = st.file_uploader("Upload Excel or CSV file", type=["xlsx", "xls", "csv"])
+uploaded_file = st.file_uploader("Upload your Excel or CSV file", type=["xlsx", "xls", "csv"])
 
 if uploaded_file:
-    # 1. Ingest file into Polars
-    if uploaded_file.name.endswith(".csv"):
-        df = pl.read_csv(uploaded_file.getvalue(), infer_schema_length=10000)
-    else:
-        df = pl.read_excel(uploaded_file.getvalue())
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pl.read_csv(uploaded_file.getvalue(), infer_schema_length=10000)
+        else:
+            df = pl.read_excel(uploaded_file.getvalue())
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+        st.stop()
 
-    st.success(f"File loaded: **{df.shape[0]} rows**, **{df.shape[1]} columns**")
+    st.success(f"Loaded: **{df.shape[0]} records**, **{df.shape[1]} columns**")
 
-    # 2. Match column headers
     cols = ["(None / Skip)"] + df.columns
 
     def auto_match(pattern: str) -> int:
@@ -214,22 +314,22 @@ if uploaded_file:
                 return i + 1
         return 0
 
-    st.subheader("Select Columns to Validate")
-    col1, col2, col3 = st.columns(3)
+    st.subheader("Select Columns to Verify")
+    c1, c2, c3 = st.columns(3)
 
-    with col1:
+    with c1:
         sel_mobile = st.selectbox(
             "📱 Mobile Phone Column",
             options=cols,
             index=auto_match(r"mobile|cell|cel")
         )
-    with col2:
+    with c2:
         sel_tele = st.selectbox(
             "☎️ Telephone / Area 02 Column",
             options=cols,
-            index=auto_match(r"telephone|tele|phone")
+            index=auto_match(r"telephone|tele")
         )
-    with col3:
+    with c3:
         sel_landline = st.selectbox(
             "🏢 Provincial Landline Column",
             options=cols,
@@ -243,11 +343,11 @@ if uploaded_file:
     }
 
     if not any(col_map.values()):
-        st.warning("Please assign at least one column to process.")
+        st.warning("Please pick at least one column.")
         st.stop()
 
-    if st.button("Identify and Clean All Numbers", type="primary"):
-        with st.spinner("Processing with Polars and Pydantic..."):
+    if st.button("Run Full Validation & Clean", type="primary"):
+        with st.spinner("Executing Pydantic hygiene guards and Polars validation..."):
             meta_dict = {}
 
             for label, col_name in col_map.items():
@@ -261,33 +361,32 @@ if uploaded_file:
                 meta_dict[f"_meta_{label}_type"] = [p["type"] for p in parsed]
                 meta_dict[f"_meta_{label}_e164"] = [p["e164"] for p in parsed]
                 meta_dict[f"_meta_{label}_local"] = [p["local"] for p in parsed]
+                meta_dict[f"_meta_{label}_remark"] = [p["remark"] for p in parsed]
 
             meta_df = pl.DataFrame(meta_dict)
             processed_df = df.hstack(meta_df)
 
-            # Metrics
+            # Metric Cards
             st.divider()
-            m_cols = st.columns(len([k for k, v in col_map.items() if v]))
-            idx = 0
-            for label, col_name in col_map.items():
-                if col_name:
-                    valid_count = sum(1 for s in meta_dict[f"_meta_{label}_status"] if s == "VALID")
-                    total_count = len(df)
-                    m_cols[idx].metric(f"{label} Valid", f"{valid_count} / {total_count}")
-                    idx += 1
+            active_labels = [k for k, v in col_map.items() if v]
+            m_cols = st.columns(len(active_labels))
+            for i, label in enumerate(active_labels):
+                valid_num = sum(1 for s in meta_dict[f"_meta_{label}_status"] if s == "VALID")
+                m_cols[i].metric(f"{label} Valid", f"{valid_num} / {len(df)}")
 
-            # Preview
-            st.subheader("Processed Data Preview")
-            display_cols = [c for c in processed_df.columns if not c.startswith("_meta_")] + [
-                f"_meta_{l}_local" for l in ["Mobile", "Telephone", "Landline"] if col_map.get(l)
-            ]
+            # Results View
+            st.subheader("Validation Breakdown")
+            display_cols = [c for c in processed_df.columns if not c.startswith("_meta_")]
+            for l in active_labels:
+                display_cols.extend([f"_meta_{l}_status", f"_meta_{l}_remark"])
+
             st.dataframe(processed_df.select(display_cols), use_container_width=True)
 
-            # Export with Dynamic Formulas
+            # File Export
             excel_bytes = export_multi_column_excel(processed_df, col_map)
             st.download_button(
-                label="📥 Download Cleaned Excel (With Live =IF() Formulas)",
+                label="📥 Download Excel with Dynamic Formulas & Remarks",
                 data=excel_bytes,
-                file_name=f"Cleaned_{uploaded_file.name.rsplit('.', 1)[0]}.xlsx",
+                file_name=f"Verified_{uploaded_file.name.rsplit('.', 1)[0]}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
