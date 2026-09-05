@@ -8,29 +8,26 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# Page Config
-st.set_page_config(page_title="PH Phone Validator & Cleaner", layout="wide")
+st.set_page_config(page_title="PH Multi-Channel Phone Identifier", layout="wide")
 
 # =====================================================================
-# 1. PYDANTIC GUARDS (File & Row Validation)
+# 1. PYDANTIC GUARDS (Input Cell Scrubbing)
 # =====================================================================
-class RawRowRecord(BaseModel):
-    row_num: int
-    raw_phone: str = Field(..., min_length=1)
+class NumberCell(BaseModel):
+    raw_val: str
 
     @classmethod
-    def clean_cell(cls, val: Any) -> str:
+    def sanitize(cls, val: Any) -> str:
         if val is None:
             return ""
-        # Handle floats converted from numbers (e.g. 9171234567.0)
         s = str(val).strip()
-        if s.endswith(".0"):
+        if s.endswith(".0"):  # Fix Excel auto-float conversions
             s = s[:-2]
         return s
 
 
 # =====================================================================
-# 2. DETERMINISTIC PH NUMBER VALIDATION ENGINE
+# 2. VALIDATION ENGINES (Mobile, Metro 02, Provincial)
 # =====================================================================
 VALID_PROVINCIAL_AREAS = {
     "32", "33", "34", "35", "36", "38",
@@ -41,110 +38,102 @@ VALID_PROVINCIAL_AREAS = {
     "82", "83", "84", "85", "86", "87", "88"
 }
 
-def analyze_ph_phone(raw_val: str) -> Dict[str, Any]:
-    if not raw_val or raw_val.strip() == "":
-        return {
-            "is_valid": False,
-            "line_type": "Blank / Empty",
-            "e164_format": "",
-            "local_format": "",
-            "audit_remark": "Missing Number"
-        }
-
-    # Clean non-digit characters except leading plus
+def clean_to_digits(raw_val: str) -> str:
     cleaned = re.sub(r'[\s\-\(\)\.]', '', str(raw_val).strip())
-
-    # Strip national prefixes (+63, 63, 0)
     if cleaned.startswith('+63'):
         cleaned = cleaned[3:]
     elif cleaned.startswith('63'):
         cleaned = cleaned[2:]
     elif cleaned.startswith('0'):
         cleaned = cleaned[1:]
+    return cleaned
 
-    # A. Check Mobile (10 digits starting with 9 or 8)
-    if len(cleaned) == 10 and re.match(r'^(9\d{9}|8[1-9]\d{8})$', cleaned):
+def validate_number(raw_val: str, expected_type: str) -> Dict[str, Any]:
+    cleaned = clean_to_digits(raw_val)
+    if not cleaned:
+        return {"status": "BLANK", "type": "Empty", "e164": "", "local": ""}
+
+    # 1. Mobile Check (10 digits starting with 9 or 8)
+    is_mobile = len(cleaned) == 10 and re.match(r'^(9\d{9}|8[1-9]\d{8})$', cleaned)
+
+    # 2. GMA / Area 02 Check (9 digits starting with 2 + valid PTE digit)
+    is_gma = (
+        len(cleaned) == 9 
+        and cleaned.startswith('2') 
+        and cleaned[1] in {'3', '5', '6', '7', '8'}
+    )
+
+    # 3. Provincial Check (9 digits starting with registered area code)
+    is_provincial = len(cleaned) == 9 and cleaned[:2] in VALID_PROVINCIAL_AREAS
+
+    # Check for legacy 7-digit Metro Manila numbers
+    is_outdated_gma = len(cleaned) == 8 and cleaned.startswith('2')
+
+    if is_mobile:
         return {
-            "is_valid": True,
-            "line_type": "Mobile",
-            "e164_format": f"+63{cleaned}",
-            "local_format": f"0{cleaned}",
-            "audit_remark": "Valid Mobile"
+            "status": "VALID",
+            "type": "Mobile",
+            "e164": f"+63{cleaned}",
+            "local": f"0{cleaned}"
         }
-
-    # B. Metro Manila / GMA Landline (Area 02 + 8 local digits with NTC PTE prefix)
-    # Valid PTEs: 3 (Bayantel), 5 (Eastern), 6 (ABS-CBN), 7 (Globe), 8 (PLDT)
-    if len(cleaned) == 9 and cleaned.startswith('2'):
-        pte = cleaned[1]
-        if pte in {'3', '5', '6', '7', '8'}:
-            return {
-                "is_valid": True,
-                "line_type": "Landline (GMA 02)",
-                "e164_format": f"+63{cleaned}",
-                "local_format": f"02-{cleaned[1:]}",
-                "audit_remark": "Valid GMA 8-Digit"
-            }
+    elif is_gma:
         return {
-            "is_valid": False,
-            "line_type": "Invalid Landline",
-            "e164_format": cleaned,
-            "local_format": cleaned,
-            "audit_remark": f"Area 02 invalid operator prefix ({pte})"
+            "status": "VALID",
+            "type": "Landline (GMA 02)",
+            "e164": f"+63{cleaned}",
+            "local": f"02-{cleaned[1:5]}-{cleaned[5:]}"
         }
-
-    # C. Provincial Landlines (2-digit area code + 7 local digits)
-    if len(cleaned) == 9 and cleaned[:2] in VALID_PROVINCIAL_AREAS:
+    elif is_provincial:
         area = cleaned[:2]
         return {
-            "is_valid": True,
-            "line_type": "Landline (Provincial)",
-            "e164_format": f"+63{cleaned}",
-            "local_format": f"0{area}-{cleaned[2:]}",
-            "audit_remark": "Valid Provincial Landline"
+            "status": "VALID",
+            "type": f"Landline (Area 0{area})",
+            "e164": f"+63{cleaned}",
+            "local": f"0{area}-{cleaned[2:5]}-{cleaned[5:]}"
         }
-
-    # Flag legacy 7-digit Metro Manila numbers
-    if len(cleaned) == 8 and cleaned.startswith('2'):
+    elif is_outdated_gma:
         return {
-            "is_valid": False,
-            "line_type": "Outdated Format",
-            "e164_format": cleaned,
-            "local_format": cleaned,
-            "audit_remark": "Old 7-digit Manila landline (needs 8-digit migration)"
+            "status": "INVALID",
+            "type": "Old 7-digit Manila",
+            "e164": cleaned,
+            "local": cleaned
+        }
+    else:
+        return {
+            "status": "INVALID",
+            "type": "Invalid Format",
+            "e164": cleaned,
+            "local": cleaned
         }
 
-    return {
-        "is_valid": False,
-        "line_type": "Invalid / Unknown",
-        "e164_format": cleaned,
-        "local_format": cleaned,
-        "audit_remark": "Invalid length or prefix"
-    }
-
 
 # =====================================================================
-# 3. OPENPYXL WORKBOOK BUILDER (Dynamic Formula Injection)
+# 3. EXCEL EXPORTER (Dynamic Native Formulas)
 # =====================================================================
-def build_excel_export(df: pl.DataFrame, phone_col: str) -> io.BytesIO:
+def export_multi_column_excel(df: pl.DataFrame, col_map: Dict[str, str]) -> io.BytesIO:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Validated Numbers"
 
-    orig_cols = [c for c in df.columns if not c.startswith("_meta_")]
-    new_cols = [
-        "Identified Type",
-        "Normalized (E.164)",
-        "Local Format",
-        "Validation Status",
-        "Dial Status (Formula)"
-    ]
-    all_headers = orig_cols + new_cols
-    ws.append(all_headers)
+    base_cols = [c for c in df.columns if not c.startswith("_meta_")]
+    headers = list(base_cols)
 
-    # Styling definitions
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-    header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
-    data_font = Font(name="Segoe UI", size=10)
+    # Build target output columns
+    for label in ["Mobile", "Telephone", "Landline"]:
+        if col_map.get(label):
+            headers.extend([
+                f"{label} Status",
+                f"{label} E.164",
+                f"{label} Local"
+            ])
+    
+    headers.append("Master Reachability (Formula)")
+    ws.append(headers)
+
+    # Styles
+    navy_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
+    data_font = Font(name="Segoe UI", size=9)
     thin_border = Border(
         left=Side(style="thin", color="D9D9D9"),
         right=Side(style="thin", color="D9D9D9"),
@@ -152,40 +141,44 @@ def build_excel_export(df: pl.DataFrame, phone_col: str) -> io.BytesIO:
         bottom=Side(style="thin", color="D9D9D9")
     )
 
-    type_col_idx = len(orig_cols) + 1
-    type_col_letter = get_column_letter(type_col_idx)
+    # Row iteration
+    for row_idx, row in enumerate(df.iter_rows(named=True), start=2):
+        row_vals = [row[c] for c in base_cols]
+        status_col_letters = []
 
-    # Populate rows
-    for row_num, row in enumerate(df.iter_rows(named=True), start=2):
-        row_data = [row[col] for col in orig_cols]
+        curr_col_idx = len(base_cols) + 1
+        for label in ["Mobile", "Telephone", "Landline"]:
+            if col_map.get(label):
+                status_col_letters.append(get_column_letter(curr_col_idx))
+                row_vals.extend([
+                    row[f"_meta_{label}_status"],
+                    row[f"_meta_{label}_e164"],
+                    row[f"_meta_{label}_local"]
+                ])
+                curr_col_idx += 3
 
-        line_type = row["_meta_type"]
-        e164 = row["_meta_e164"]
-        local_fmt = row["_meta_local"]
-        audit_note = row["_meta_remark"]
+        # Dynamic formula: checks if any of the three columns have a "VALID" status
+        or_conditions = ",".join([f'{col}{row_idx}="VALID"' for col in status_col_letters])
+        master_formula = f'=IF(OR({or_conditions}), "REACHABLE", "NO VALID NUMBERS")'
+        row_vals.append(master_formula)
 
-        # Native Dynamic Excel Formula injected into each row
-        # Reads the type cell; outputs DIALABLE vs REVIEW
-        dynamic_formula = f'=IF(OR({type_col_letter}{row_num}="Mobile", ISNUMBER(SEARCH("Landline", {type_col_letter}{row_num}))), "DIALABLE", "REVIEW / INVALID")'
+        ws.append(row_vals)
 
-        full_row = row_data + [line_type, e164, local_fmt, audit_note, dynamic_formula]
-        ws.append(full_row)
+    # Format cells
+    for col_idx in range(1, len(headers) + 1):
+        c = ws.cell(row=1, column=col_idx)
+        c.fill = navy_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Apply styling & borders
-    for col_idx in range(1, len(all_headers) + 1):
-        h_cell = ws.cell(row=1, column=col_idx)
-        h_cell.fill = header_fill
-        h_cell.font = header_font
-        h_cell.alignment = Alignment(horizontal="center", vertical="center")
+    for r in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(headers)):
+        for c in r:
+            c.font = data_font
+            c.border = thin_border
 
-    for r in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(all_headers)):
-        for cell in r:
-            cell.font = data_font
-            cell.border = thin_border
-
-    # Dynamic column widths
+    # Auto-fit column widths
     for col in ws.columns:
-        max_len = max(len(str(cell.value or '')) for cell in col)
+        max_len = max(len(str(cell.value or "")) for cell in col)
         col_letter = get_column_letter(col[0].column)
         ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
 
@@ -196,99 +189,105 @@ def build_excel_export(df: pl.DataFrame, phone_col: str) -> io.BytesIO:
 
 
 # =====================================================================
-# 4. STREAMLIT INTERFACE
+# 4. STREAMLIT UI
 # =====================================================================
-st.title("Philippine Phone & Landline Identifier")
-st.caption("Upload your spreadsheet, pick the target number column, and export a scrubbed file with dynamic Excel validation formulas.")
+st.title("Philippine Phone, Telephone & Landline Identifier")
+st.caption("Validates Mobile (09XX/08XX), Metro Manila Area 02 (8-digit NTC), and Provincial Area Codes simultaneously.")
 
 uploaded_file = st.file_uploader("Upload Excel or CSV file", type=["xlsx", "xls", "csv"])
 
 if uploaded_file:
-    # 1. Read into Polars
-    try:
-        if uploaded_file.name.endswith(".csv"):
-            df = pl.read_csv(uploaded_file.getvalue(), infer_schema_length=10000)
-        else:
-            df = pl.read_excel(uploaded_file.getvalue())
-    except Exception as e:
-        st.error(f"Error loading file: {e}")
+    # 1. Ingest file into Polars
+    if uploaded_file.name.endswith(".csv"):
+        df = pl.read_csv(uploaded_file.getvalue(), infer_schema_length=10000)
+    else:
+        df = pl.read_excel(uploaded_file.getvalue())
+
+    st.success(f"File loaded: **{df.shape[0]} rows**, **{df.shape[1]} columns**")
+
+    # 2. Match column headers
+    cols = ["(None / Skip)"] + df.columns
+
+    def auto_match(pattern: str) -> int:
+        for i, c in enumerate(df.columns):
+            if re.search(pattern, c, re.IGNORECASE):
+                return i + 1
+        return 0
+
+    st.subheader("Select Columns to Validate")
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        sel_mobile = st.selectbox(
+            "📱 Mobile Phone Column",
+            options=cols,
+            index=auto_match(r"mobile|cell|cel")
+        )
+    with col2:
+        sel_tele = st.selectbox(
+            "☎️ Telephone / Area 02 Column",
+            options=cols,
+            index=auto_match(r"telephone|tele|phone")
+        )
+    with col3:
+        sel_landline = st.selectbox(
+            "🏢 Provincial Landline Column",
+            options=cols,
+            index=auto_match(r"landline|provincial")
+        )
+
+    col_map = {
+        "Mobile": sel_mobile if sel_mobile != "(None / Skip)" else None,
+        "Telephone": sel_tele if sel_tele != "(None / Skip)" else None,
+        "Landline": sel_landline if sel_landline != "(None / Skip)" else None,
+    }
+
+    if not any(col_map.values()):
+        st.warning("Please assign at least one column to process.")
         st.stop()
 
-    st.success(f"File loaded successfully: **{df.shape[0]} rows**, **{df.shape[1]} columns**")
+    if st.button("Identify and Clean All Numbers", type="primary"):
+        with st.spinner("Processing with Polars and Pydantic..."):
+            meta_dict = {}
 
-    # 2. Select the target phone column
-    all_columns = df.columns
-    # Auto-detect sensible default
-    default_idx = 0
-    for idx, col in enumerate(all_columns):
-        if any(term in col.lower() for term in ["phone", "tel", "landline", "mobile", "contact"]):
-            default_idx = idx
-            break
+            for label, col_name in col_map.items():
+                if not col_name:
+                    continue
 
-    selected_col = st.selectbox(
-        "Select the column containing Phone / Landline / Mobile numbers:",
-        options=all_columns,
-        index=default_idx
-    )
+                raw_cells = [NumberCell.sanitize(v) for v in df[col_name].to_list()]
+                parsed = [validate_number(val, label) for val in raw_cells]
 
-    if st.button("Identify and Clean Numbers", type="primary"):
-        with st.spinner("Validating with Pydantic & Polars..."):
-            # 3. Pydantic Guard Check
-            raw_values = df[selected_col].to_list()
-            guard_errors = []
-            cleaned_strings = []
+                meta_dict[f"_meta_{label}_status"] = [p["status"] for p in parsed]
+                meta_dict[f"_meta_{label}_type"] = [p["type"] for p in parsed]
+                meta_dict[f"_meta_{label}_e164"] = [p["e164"] for p in parsed]
+                meta_dict[f"_meta_{label}_local"] = [p["local"] for p in parsed]
 
-            for i, val in enumerate(raw_values, start=2):
-                cleaned_str = RawRowRecord.clean_cell(val)
-                try:
-                    record = RawRowRecord(row_num=i, raw_phone=cleaned_str)
-                    cleaned_strings.append(record.raw_phone)
-                except ValidationError:
-                    cleaned_strings.append("")
-                    guard_errors.append(f"Row {i}: Missing or empty contact number.")
-
-            if guard_errors and len(guard_errors) == len(raw_values):
-                st.error("Every row in the selected column is empty or invalid. Please check your column selection.")
-                st.stop()
-
-            # 4. Polars Vectorized Mapping
-            meta_results = [analyze_ph_phone(p) for p in cleaned_strings]
-
-            meta_df = pl.DataFrame({
-                "_meta_type": [m["line_type"] for m in meta_results],
-                "_meta_e164": [m["e164_format"] for m in meta_results],
-                "_meta_local": [m["local_format"] for m in meta_results],
-                "_meta_remark": [m["audit_remark"] for m in meta_results],
-            })
-
+            meta_df = pl.DataFrame(meta_dict)
             processed_df = df.hstack(meta_df)
 
-            # 5. Display Breakdown & Metrics
+            # Metrics
             st.divider()
-            types_counts = meta_df["_meta_type"].value_counts().to_dicts()
+            m_cols = st.columns(len([k for k, v in col_map.items() if v]))
+            idx = 0
+            for label, col_name in col_map.items():
+                if col_name:
+                    valid_count = sum(1 for s in meta_dict[f"_meta_{label}_status"] if s == "VALID")
+                    total_count = len(df)
+                    m_cols[idx].metric(f"{label} Valid", f"{valid_count} / {total_count}")
+                    idx += 1
 
-            col1, col2, col3, col4 = st.columns(4)
-            mobiles = sum(c["count"] for c in types_counts if c["_meta_type"] == "Mobile")
-            landlines = sum(c["count"] for c in types_counts if "Landline" in c["_meta_type"])
-            invalids = sum(c["count"] for c in types_counts if "Invalid" in c["_meta_type"] or "Unknown" in c["_meta_type"])
-            blanks = sum(c["count"] for c in types_counts if c["_meta_type"] == "Blank / Empty")
+            # Preview
+            st.subheader("Processed Data Preview")
+            display_cols = [c for c in processed_df.columns if not c.startswith("_meta_")] + [
+                f"_meta_{l}_local" for l in ["Mobile", "Telephone", "Landline"] if col_map.get(l)
+            ]
+            st.dataframe(processed_df.select(display_cols), use_container_width=True)
 
-            col1.metric("Mobile Numbers", mobiles)
-            col2.metric("Landlines", landlines)
-            col3.metric("Invalid / Outdated", invalids)
-            col4.metric("Blank / Empty", blanks)
-
-            # 6. Preview Result Table
-            st.subheader("Data Preview")
-            preview_cols = [selected_col, "_meta_type", "_meta_e164", "_meta_local", "_meta_remark"]
-            st.dataframe(processed_df.select(preview_cols).head(10), use_container_width=True)
-
-            # 7. Generate openpyxl Workbook with Dynamic Formulas
-            excel_buffer = build_excel_export(processed_df, selected_col)
-
+            # Export with Dynamic Formulas
+            excel_bytes = export_multi_column_excel(processed_df, col_map)
             st.download_button(
-                label="📥 Download Cleaned Excel File (With Live Formulas)",
-                data=excel_buffer,
+                label="📥 Download Cleaned Excel (With Live =IF() Formulas)",
+                data=excel_bytes,
                 file_name=f"Cleaned_{uploaded_file.name.rsplit('.', 1)[0]}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
