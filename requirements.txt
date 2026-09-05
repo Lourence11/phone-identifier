@@ -1,0 +1,6 @@
+polars 
+pydantic 
+xlsxwriter 
+openpyxl 
+phonenumbers 
+httpx
